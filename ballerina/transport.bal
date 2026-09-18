@@ -18,56 +18,99 @@ import ballerina/http;
 import ballerina/lang.array;
 import ballerina/lang.runtime;
 import ballerina/time;
+import ballerinax/aws.auth;
 
-// SigV4 transport — per-route signing (§9.4), retry (§9.5), error mapping (§9.5).
-// SigV4 scaffolding (canonical request, signing-key derivation, base16 hex)
-// mirrors the ballerinax/aws.dynamodb connector's proven `utils.bal`.
+// SigV4 transport — per-route signing, retry, error mapping.
+//
+// CREDENTIAL RESOLUTION is delegated to `auth:CredentialProvider` (the full AWS
+// chain, with expiry/refresh owned by the provider). SIGNING stays here, and must:
+// `auth:getSignedHeaders` builds its canonical URI by double-encoding while always
+// treating `/` as a structural separator, so for a model-id ARN it emits
+// `...inference-profile/us.anthropic...` where AWS expects
+// `...inference-profile%252Fus.anthropic...`. No input string fixes that — `/`
+// survives both passes unchanged and a pre-encoded `%2F` becomes `%25252F` — so
+// every provisioned-model / inference-profile / custom-model-deployment ARN would
+// fail with SignatureDoesNotMatch. Verified 2026-08-09 against aws 1.0.1.
 
 const APPLICATION_JSON = "application/json";
 const AWS4_HMAC_SHA256 = "AWS4-HMAC-SHA256";
 const AWS4_REQUEST = "aws4_request";
 
 // Wraps SigV4 signing + an HTTP client + retry/error mapping for one resolved
-// route (design §9.4-9.5). Resolve-once: host, path, and signing scope are fixed.
+// route. Resolve-once: host, path, and signing scope are fixed.
 isolated client class BedrockTransport {
-    private final readonly & BedrockCredentials credentials;
+    // Exactly one of these is set. A bearer bypasses SigV4, so it never reaches
+    // `CredentialProvider`; every other credential source resolves through it.
+    private final auth:CredentialProvider? credProvider;
+    private final readonly & BearerToken? bearer;
     private final string region;
     private final string signingService;
     private final string host;
     private final string wirePath; // model-id segment single-encoded (from buildEndpoint)
+    // The streaming sibling of `wirePath` (`converse-stream` /
+    // `invoke-with-response-stream`), or `()` on a route that has none.
+    private final string? streamPath;
     private final http:Client httpClient;
     private final readonly & RetryConfig retryConfig;
-    // Whether the RESOLVED ROUTE is Mantle. Derived from the route's own signing
-    // name, never from the `signingServiceName` override — otherwise a user of that
-    // escape hatch silently loses the `bedrock-mantle:CreateInference` hint on a
-    // 403, which is the difference between a solvable and an unsolvable error.
+    // Whether the RESOLVED ROUTE is Mantle — drives the
+    // `bedrock-mantle:CreateInference` hint on a 403.
     private final boolean isMantleRoute;
+    // Whether this transport talks to the `bedrock-agent`/`bedrock-agent-runtime`
+    // control/data planes (knowledge bases) rather than a model route. Swaps the
+    // 400/403/404 hints for KB-appropriate wording and adds 402/409 handling — the
+    // agent control plane returns 402 for quota, not 400, and only it can 409.
+    private final boolean isAgentRoute;
 
     isolated function init(BedrockCredentials credentials, string region, Endpoint ep,
-            string? signingServiceName = (), http:ClientConfiguration? httpConfig = (),
-            RetryConfig? retryConfig = ()) returns error? {
-        self.credentials = credentials.cloneReadOnly();
+            http:ClientConfiguration? httpConfig = (), RetryConfig? retryConfig = (),
+            boolean isAgentRoute = false) returns error? {
+        if credentials is BearerToken {
+            self.bearer = credentials.cloneReadOnly();
+            self.credProvider = ();
+        } else {
+            self.bearer = ();
+            // Resolves eagerly, so a bad profile/role surfaces at construction rather
+            // than on the first chat() call.
+            self.credProvider = check new (credentials);
+        }
         self.region = region;
-        // Signing name defaults per route, overridable without a release (§9.4).
-        self.signingService = signingServiceName ?: ep.signingService;
+        // Signing name comes from the route and only from the route: `bedrock` for
+        // Converse/Invoke, `bedrock-mantle` for Mantle. A custom `serviceUrl` (VPCE,
+        // FIPS, gateway) changes the HOST, never the signing scope.
+        self.signingService = ep.signingService;
         self.isMantleRoute = ep.signingService == SIGNING_BEDROCK_MANTLE;
+        self.isAgentRoute = isAgentRoute;
         self.host = ep.host;
         self.wirePath = ep.path;
-        self.httpClient = check new (string `https://${ep.host}`, httpConfig ?: {});
+        self.streamPath = ep.streamPath;
+        self.httpClient = check new (ep.baseUrl, httpConfig ?: {});
         RetryConfig rc = retryConfig ?: {};
         self.retryConfig = rc.cloneReadOnly();
     }
 
-    // POSTs a signed request and returns the JSON response plus the response
-    // headers we care about (design §9.5), retrying transient errors with
+    // POSTs a signed request to the fixed `wirePath` and returns the JSON response
+    // plus the response headers we care about, retrying transient errors with
     // exponential backoff. `extraHeaders` carry route-specific headers (guardrail,
     // anthropic-version, workspace, api-key) — all of them are signed.
-    isolated function execute(json body, map<string> extraHeaders = {}) returns TransportResponse|ai:Error {
+    //
+    // A thin fixed-method/path wrapper over `executeRequest`, kept so every existing
+    // model/embedding call site (`transport.execute(body, headers)`) is untouched.
+    isolated function execute(json body, map<string> extraHeaders = {}) returns TransportResponse|ai:Error
+        => self.executeRequest("POST", self.wirePath, body, extraHeaders);
+
+    // The general form: method and path vary per call, for the knowledge-base agent
+    // planes where one transport instance serves many paths on the same host
+    // (`/knowledgebases/`, `/knowledgebases/{id}/retrieve`,
+    // `/knowledgebases/{id}/datasources/{id}/documents`, …). `body` is `()` for a
+    // bodyless `GET`/`DELETE` — signed as the SHA-256 of the empty string, per SigV4.
+    isolated function executeRequest(string method, string path, json? body, map<string> extraHeaders = {})
+            returns TransportResponse|ai:Error {
         RetryConfig rc = self.retryConfig;
         int attempt = 0;
         decimal delay = rc.initialDelay;
         while true {
-            TransportResponse|RetryableError|ai:Error result = self.executeOnce(body, extraHeaders);
+            TransportResponse|RetryableError|ai:Error result =
+                self.executeRequestOnce(method, path, body, extraHeaders);
             if result is TransportResponse {
                 return result; // success
             }
@@ -87,22 +130,24 @@ isolated client class BedrockTransport {
         }
     }
 
-    // A single signed round-trip (design §9.5). The wire path is sent single-
-    // encoded; the canonical URI is double-encoded for the signature (§9.4).
-    isolated function executeOnce(json body, map<string> extraHeaders)
+    // A single signed round-trip. The path is sent single-
+    // encoded; the canonical URI is double-encoded for the signature.
+    isolated function executeRequestOnce(string method, string path, json? body, map<string> extraHeaders)
             returns TransportResponse|RetryableError|ai:Error {
-        string payload = body.toJsonString();
-        map<string>|error headers = self.signedHeaders(payload, extraHeaders);
+        string payload = body is () ? "" : body.toJsonString();
+        map<string>|error headers = self.signedHeadersFor(method, path, payload, extraHeaders);
         if headers is error {
             return error ai:Error("Failed to sign the Bedrock request", headers);
         }
         http:Request req = new;
-        req.setTextPayload(payload, contentType = APPLICATION_JSON);
+        if body !is () {
+            req.setTextPayload(payload, contentType = APPLICATION_JSON);
+        }
         foreach [string, string] [k, v] in headers.entries() {
             req.setHeader(k, v);
         }
-        // Wire path is already single-encoded by buildEndpoint; send it verbatim.
-        http:Response|error resp = self.httpClient->post(self.wirePath, req);
+        // Path is already single-encoded by buildEndpoint; send it verbatim.
+        http:Response|error resp = self.httpClient->execute(method, path, req);
         if resp is error {
             // Transport-level failure (DNS, TLS, socket) — treat as retryable.
             return error RetryableError("Connection error while calling Bedrock", resp);
@@ -110,7 +155,107 @@ isolated client class BedrockTransport {
         return self.mapResponse(resp);
     }
 
+    // POSTs a signed request to the STREAMING sibling path and hands back the live
+    // response with its body unread, for the caller to frame incrementally.
+    //
+    // SIGNING IS UNCHANGED from the buffered path, and deliberately so: Bedrock
+    // streams the RESPONSE, not the request. The request is an ordinary signed POST
+    // carrying a complete JSON body, so the payload hash is over the whole body and
+    // none of SigV4's chunked-upload machinery (an S3 concern) applies.
+    //
+    // RETRY COVERS ONLY THE HANDSHAKE — the connection and the response status. Once
+    // a 2xx is in hand the response is returned live, and a failure after that
+    // cannot be retried: chunks have already been delivered to the caller, and
+    // re-sending would duplicate the answer rather than resume it.
+    //
+    // + sse - Whether the route answers `text/event-stream` (Mantle) rather than
+    //         AWS's binary event-stream. Adds the matching `Accept`, which is
+    //         SIGNED like every other header we send
+    isolated function executeStreaming(json body, map<string> extraHeaders = {}, boolean sse = false)
+            returns [http:Response, map<string>]|ai:Error {
+        string? path = self.streamPath;
+        if path is () {
+            // Reached only if a codec carries a `streamDialect` without a stream
+            // path being built for its route — a wiring bug.
+            return error ai:Error("This Bedrock route has no streaming endpoint");
+        }
+        map<string> headers = extraHeaders;
+        if sse {
+            // Copied entry by entry, NOT with `clone()`: the facades pass a
+            // `readonly &` header map, and cloning an immutable value hands back the
+            // same immutable value — so the `Accept` insertion panicked with
+            // "modification not allowed on readonly value" on the first Mantle
+            // stream.
+            map<string> withAccept = {};
+            foreach [string, string] [name, value] in extraHeaders.entries() {
+                withAccept[name] = value;
+            }
+            withAccept[ACCEPT_HEADER] = TEXT_EVENT_STREAM;
+            headers = withAccept;
+        }
+        RetryConfig rc = self.retryConfig;
+        int attempt = 0;
+        decimal delay = rc.initialDelay;
+        while true {
+            [http:Response, map<string>]|RetryableError|ai:Error result =
+                self.executeStreamingOnce(path, body, headers);
+            if result is [http:Response, map<string>] {
+                return result;
+            }
+            if result is ai:Error {
+                return result;
+            }
+            if result is RetryableError {
+                if attempt >= rc.maxRetries {
+                    return error ai:LlmConnectionError(
+                        string `${result.message()} (retries exhausted after ${rc.maxRetries} attempts)`, result.cause());
+                }
+                runtime:sleep(delay);
+                delay = decimal:min(delay * rc.backoffFactor, rc.maxDelay);
+                attempt += 1;
+            }
+        }
+    }
+
+    // One signed streaming round-trip. Returns the response with its body UNREAD —
+    // calling `getJsonPayload`/`getTextPayload` here would buffer the whole stream
+    // and defeat the point. Only the error paths read the body, and only after the
+    // status has already ruled out a stream.
+    isolated function executeStreamingOnce(string path, json body, map<string> extraHeaders)
+            returns [http:Response, map<string>]|RetryableError|ai:Error {
+        string payload = body.toJsonString();
+        map<string>|error headers = self.signedHeadersFor("POST", path, payload, extraHeaders);
+        if headers is error {
+            return error ai:Error("Failed to sign the Bedrock streaming request", headers);
+        }
+        http:Request req = new;
+        req.setTextPayload(payload, contentType = APPLICATION_JSON);
+        foreach [string, string] [k, v] in headers.entries() {
+            req.setHeader(k, v);
+        }
+        http:Response|error resp = self.httpClient->post(path, req);
+        if resp is error {
+            return error RetryableError("Connection error while opening the Bedrock stream", resp);
+        }
+        http:Response response = resp;
+        int status = response.statusCode;
+        if status < 200 || status >= 300 {
+            return self.mapErrorStatus(response, streaming = true);
+        }
+        // The request id is the only response header the stream needs: the event
+        // payloads carry no completion id of their own, and the `ai` contract wants
+        // one that is stable across every chunk of a response.
+        map<string> responseHeaders = {};
+        string? requestId = optionalHeader(response, "x-amzn-RequestId");
+        if requestId is string {
+            responseHeaders[REQUEST_ID_HEADER] = requestId;
+        }
+        return [response, responseHeaders];
+    }
+
     // Maps an HTTP response to a `TransportResponse` or a typed error (§9.5 table).
+
+    // Maps an HTTP response to a `TransportResponse` or a typed error.
     isolated function mapResponse(http:Response resp) returns TransportResponse|RetryableError|ai:Error {
         int status = resp.statusCode;
         if status >= 200 && status < 300 {
@@ -118,10 +263,10 @@ isolated client class BedrockTransport {
             if jsonBody is error {
                 return error ai:LlmInvalidResponseError("Bedrock response was not valid JSON", jsonBody);
             }
-            // Capture the response headers the decoder/provider needs (§9.5).
+            // Capture the response headers the decoder/provider needs.
             //
             // The guardrail-fired signal is NOT here: it is a response BODY field
-            // (`amazon-bedrock-guardrailAction`), read by each Invoke codec via
+            // (`amazon-bedrock-guardrailAction`), read by each Invoke converter via
             // `invokeGuardrailAction`. InvokeModel documents only three response
             // headers, and no guardrail among them — the `X-Amzn-Bedrock-Guardrail*`
             // headers are request-only.
@@ -133,8 +278,19 @@ isolated client class BedrockTransport {
             }
             return {body: jsonBody, headers: responseHeaders};
         }
+        return self.mapErrorStatus(resp);
+    }
+
+    // Non-2xx -> a typed error. EXTRACTED from `mapResponse` so the streaming path
+    // shares the exact same status table — duplicating it would let the two drift.
+    // `streaming` only selects the 403 hint, where the two routes genuinely differ:
+    // the missing IAM action is `bedrock:InvokeModelWithResponseStream`, not
+    // `bedrock:InvokeModel`.
+    isolated function mapErrorStatus(http:Response resp, boolean streaming = false) returns RetryableError|ai:Error {
+        int status = resp.statusCode;
         string detail = self.errorDetail(resp);
         boolean mantle = self.isMantleRoute;
+        boolean agent = self.isAgentRoute;
         match status {
             // 502/504 come from the load balancers fronting Bedrock rather than the
             // service itself, so they carry no Bedrock error code — but they are just
@@ -143,19 +299,53 @@ isolated client class BedrockTransport {
                 return error RetryableError(string `Bedrock transient error (HTTP ${status}): ${detail}`);
             }
             400 => {
-                return error ai:Error(string `Bedrock ValidationException (HTTP 400): ${detail}. ` +
-                    string `The model may not support this route; try 'apiFamily = INVOKE' (or CONVERSE).`);
+                // Only append the routing hint when `detail` is itself the useless
+                // "status 400" fallback — when Bedrock sent a specific reason (e.g.
+                // "Model does not support image modality"), tacking on a generic
+                // routing guess is redundant at best and misleading at worst. Never on
+                // an agent (KB) route: there is no `apiFamily` to retry with there.
+                string hint = !agent && detail.startsWith("status ")
+                    ? " The model may not support this route; try 'apiFamily = INVOKE' (or CONVERSE)."
+                    : "";
+                return error ai:Error(string `Bedrock ValidationException (HTTP 400): ${detail}.${hint}`);
+            }
+            // The bedrock-agent control plane returns 402, not 400, for a quota
+            // violation (e.g. IngestKnowledgeBaseDocuments over a service limit).
+            // https://docs.aws.amazon.com/bedrock/latest/APIReference/API_agent_IngestKnowledgeBaseDocuments.html
+            402 => {
+                return error ai:Error(string `Bedrock ServiceQuotaExceededException (HTTP 402): ${detail}`);
             }
             403 => {
-                string hint = mantle
-                    ? " Mantle needs the separate 'bedrock-mantle:CreateInference' IAM action — " +
-                        "'bedrock:InvokeModel' permissions are NOT sufficient."
-                    : "";
+                // The likely missing action differs per route, and naming the wrong
+                // one sends the reader to the wrong policy. Streaming is its OWN IAM
+                // action on both runtime operations — `ConverseStream` included,
+                // despite being authorized separately from `Converse` — so a role
+                // that calls `chat` fine can still be denied `chatAsStream`.
+                string hint;
+                if mantle {
+                    // Covers streaming and non-streaming alike on this endpoint,
+                    // which is why it is checked before `streaming`.
+                    hint = " Mantle needs the separate 'bedrock-mantle:CreateInference' IAM action — " +
+                        "'bedrock:InvokeModel' permissions are NOT sufficient.";
+                } else if streaming {
+                    hint = " Streaming needs the separate 'bedrock:InvokeModelWithResponseStream' IAM " +
+                        "action — 'bedrock:InvokeModel' alone covers 'chat' but NOT 'chatAsStream'.";
+                } else if agent {
+                    hint = " Knowledge base ingestion needs BOTH 'bedrock:StartIngestionJob' and " +
+                        "'bedrock:IngestKnowledgeBaseDocuments' — either alone is insufficient.";
+                } else {
+                    hint = "";
+                }
                 return error ai:Error(string `Bedrock AccessDeniedException (HTTP 403): ${detail}.${hint}`);
             }
             404 => {
-                return error ai:Error(string `Bedrock ResourceNotFoundException (HTTP 404): ${detail}. ` +
-                    string `Check the model id and region.`);
+                string hint = agent
+                    ? "Check the knowledge base and data source id."
+                    : "Check the model id and region.";
+                return error ai:Error(string `Bedrock ResourceNotFoundException (HTTP 404): ${detail}. ${hint}`);
+            }
+            409 => {
+                return error ai:Error(string `Bedrock ConflictException (HTTP 409): ${detail}`);
             }
             424 => {
                 return error ai:LlmError(string `Bedrock ModelErrorException (HTTP 424): ${detail}`);
@@ -166,32 +356,67 @@ isolated client class BedrockTransport {
         }
     }
 
-    // Best-effort extraction of Bedrock's error message from the response body.
+    // Best-effort extraction of the error message from the response body.
+    //
+    // THREE SHAPES, because this transport spans three gateways. Bedrock's own APIs
+    // use a top-level `message`; the OpenAI-compatible Mantle paths use the OpenAI
+    // convention `{"error": {"message": ..., "code": ...}}`; and some upstream errors
+    // arrive with `error` as a bare string. Checking only the first meant every
+    // Mantle-route 400 degraded to the useless "status 400" — which is exactly what a
+    // caller sending an image to a model that does not accept one used to see.
     isolated function errorDetail(http:Response resp) returns string {
         json|error j = resp.getJsonPayload();
-        if j is map<json> {
-            json? msg = j["message"] ?: j["Message"];
-            if msg is string {
-                return msg;
+        if j !is map<json> {
+            return string `status ${resp.statusCode}`;
+        }
+        json? msg = j["message"] ?: j["Message"];
+        if msg is string && msg.trim() != "" {
+            return msg;
+        }
+        json? err = j["error"];
+        if err is map<json> {
+            json? nested = err["message"];
+            if nested is string && nested.trim() != "" {
+                // Keep the provider's own code when it sent one — `validation_error`
+                // vs `invalid_request_error` is the difference between "your body is
+                // wrong" and "this model cannot do that".
+                json? code = err["code"] ?: err["type"];
+                return code is string ? string `${nested} (${code})` : nested;
             }
+        }
+        if err is string && err.trim() != "" {
+            return err;
         }
         return string `status ${resp.statusCode}`;
     }
 
-    // Builds the SigV4 (or bearer) headers for one request (design §9.4-9.5).
+    // Builds the SigV4 (or bearer) headers for a request against the fixed
+    // `wirePath`, using `POST` (every model/embedding route). A thin wrapper over
+    // `signedHeadersFor`, kept so the existing golden signing tests — pinned to this
+    // exact signature — need no change.
+    isolated function signedHeaders(string payload, map<string> extraHeaders,
+            [string, string]? fixedClock = ()) returns map<string>|error
+        => self.signedHeadersFor("POST", self.wirePath, payload, extraHeaders, fixedClock);
+
+    // Builds the SigV4 (or bearer) headers for one request, method and path both
+    // caller-supplied — the knowledge-base planes call many paths per transport
+    // instance, and streaming signs a DIFFERENT path from the buffered call
+    // (`converse-stream` rather than `converse`), so neither can stay fixed at
+    // `self.wirePath`/`"POST"`. The path is baked into the canonical URI, so
+    // signing the wrong one yields `SignatureDoesNotMatch`, not a 404.
     // `fixedClock` exists ONLY for tests: signing is otherwise unobservable without
     // live AWS, and a wall clock makes the output unassertable. Production callers
     // omit it and get `amzTimestamps()`.
-    isolated function signedHeaders(string payload, map<string> extraHeaders,
+    isolated function signedHeadersFor(string method, string path, string payload, map<string> extraHeaders,
             [string, string]? fixedClock = ()) returns map<string>|error {
         map<string> headers = {};
         foreach [string, string] [k, v] in extraHeaders.entries() {
             headers[k] = v;
         }
-        BedrockCredentials creds = self.credentials;
+        BearerToken? bearerCreds = self.bearer;
 
-        // Bedrock API key (bearer) — first-class on both endpoints (§9.5): skip SigV4.
-        if creds is BearerToken {
+        // Bedrock API key (bearer) — first-class on both endpoints: skip SigV4.
+        if bearerCreds is BearerToken {
             // Anthropic's Mantle surface REJECTS a request carrying BOTH `Authorization`
             // and `x-api-key` (verified live 2026-08-03: either header alone -> 200, both
             // -> 401 `authentication_error: "request must not include both 'authorization'
@@ -201,24 +426,31 @@ isolated client class BedrockTransport {
             // a routeOverrides entry using a different casing (e.g. `X-Api-Key`) cannot
             // slip past and resurrect the collision.
             if !hasApiKeyHeader(headers) {
-                headers["Authorization"] = string `Bearer ${creds.apiKey}`;
+                headers["Authorization"] = string `Bearer ${bearerCreds.apiKey}`;
             }
             headers["Content-Type"] = APPLICATION_JSON;
             return headers;
         }
 
-        // ---- SigV4 (static / STS) ----
+        // ---- SigV4 ----
+        // Credentials come from the chain on EVERY request, not once at construction:
+        // IMDS/ECS/IRSA/AssumeRole credentials expire, and the provider refreshes them
+        // behind its own lock. Nothing mutable lives in this class.
+        auth:CredentialProvider provider = check self.credProvider.ensureType();
+        auth:Credentials creds = check provider.getCredentials();
         [string, string] [amzDate, dateStamp] = fixedClock ?: check amzTimestamps();
-        // Canonical URI is the DOUBLE-encoded wire path (SigV4 non-S3 rule §9.4):
+        // Canonical URI is the DOUBLE-encoded wire path (SigV4 non-S3 rule):
         // the server re-encodes the received (single-encoded) path once to match.
-        string canonicalUri = getCanonicalUri(self.wirePath);
+        string canonicalUri = getCanonicalUri(path);
         string payloadHash = array:toBase16(crypto:hashSha256(payload.toBytes())).toLowerAscii();
 
         string accessKey = creds.accessKeyId;
         string secretKey = creds.secretAccessKey;
-        string? sessionToken = creds is StsCredentials ? creds.sessionToken : ();
+        // Present for every temporary-credential source (STS, AssumeRole, IRSA, IMDS,
+        // SSO), absent for long-lived access keys.
+        string? sessionToken = creds?.sessionToken;
 
-        // Sign EVERY header we send (§9.5), sorted by lowercased name.
+        // Sign EVERY header we send, sorted by lowercased name.
         map<string> toSign = {"content-type": APPLICATION_JSON, "host": self.host, "x-amz-date": amzDate};
         if sessionToken is string {
             toSign["x-amz-security-token"] = sessionToken;
@@ -233,7 +465,7 @@ isolated client class BedrockTransport {
         }
         string signedHeaderList = string:'join(";", ...sortedNames);
 
-        string canonicalRequest = "POST" + "\n" + canonicalUri + "\n" + "" + "\n" +
+        string canonicalRequest = method + "\n" + canonicalUri + "\n" + "" + "\n" +
             canonicalHeaders + "\n" + signedHeaderList + "\n" + payloadHash;
         string credentialScope = string `${dateStamp}/${self.region}/${self.signingService}/${AWS4_REQUEST}`;
         string stringToSign = AWS4_HMAC_SHA256 + "\n" + amzDate + "\n" + credentialScope + "\n" +
@@ -268,16 +500,24 @@ isolated function hasApiKeyHeader(map<string> headers) returns boolean {
 }
 
 // A successful transport round-trip: the JSON body plus the selected response
-// headers the decoder/provider needs (design §9.5).
+// headers the decoder/provider needs.
 type TransportResponse record {|
     json body;
     map<string> headers;
 |};
 
-// Response-header keys captured into `TransportResponse.headers` (design §9.5).
+// Response-header keys captured into `TransportResponse.headers`.
 const REQUEST_ID_HEADER = "requestId";
 
+// Sent on a Mantle streaming request. The vendor APIs answer SSE either way, but
+// `http:Response.getSseEventStream()` refuses anything that is not
+// `text/event-stream`, so asking for it explicitly is what keeps a proxy or a future
+// content negotiation from turning a good stream into a binding error.
+const ACCEPT_HEADER = "Accept";
+const TEXT_EVENT_STREAM = "text/event-stream";
+
 // A retryable transport outcome (408/429/500/502/503/504 or a connection failure — §9.5).
+// A retryable transport outcome (408/429/500/502/503/504 or a connection failure).
 // A `distinct error` so it narrows cleanly against `json` and `ai:Error`.
 type RetryableError distinct error;
 
@@ -326,7 +566,7 @@ isolated function pad(int n, int width) returns string {
 }
 
 // Double-encodes the (already single-encoded) wire path for the SigV4 canonical
-// URI (non-S3 rule §9.4): encode again, then restore structural `/` separators
+// URI (non-S3 rule): encode again, then restore structural `/` separators
 // (their `%2F` maps back to `/`, while a model-id's internal `%2F`→`%252F` stays
 // double-encoded).
 //
@@ -337,7 +577,7 @@ isolated function getCanonicalUri(string wirePath) returns string {
     return re `%2F`.replaceAll(encodePathSegment(wirePath), "/");
 }
 
-// SigV4 signing-key derivation (design §9.4). Identical to aws.dynamodb.
+// SigV4 signing-key derivation. Identical to aws.dynamodb.
 isolated function getSignatureKey(string secretKey, string dateStamp, string region, string serviceName)
         returns byte[]|error {
     byte[] kDate = check crypto:hmacSha256(dateStamp.toBytes(), ("AWS4" + secretKey).toBytes());
